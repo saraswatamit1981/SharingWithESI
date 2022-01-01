@@ -1,0 +1,153 @@
+# This is a sample Python script.
+import datetime
+import json
+import sys
+
+import pandas as pd
+import argparse
+import os
+
+route_filter = "/ivr/hooks"
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Gets Nginx stats")
+    parser.add_argument("-i", "--input", nargs='+', help="Optional. Default 'api_access.log'. \nSource file path(s)\nEx: -i api_access.log api_access2.log", default=["api_access.log"])
+    parser.add_argument("-o", "--output", help="Optional. Default 'stats.csv'. \nOutput file to be generated for stats", default="stats.csv")
+    parser.add_argument("-e", "--errors", help="Optional. Default 'errors.csv'. \nOutput file to be generated for errors", default="errors.csv")
+    parser.add_argument("-dd", "--deduplicate", help="Optional. Default 'Yes'. \nYes for depuplicating region routing requests", default="Yes")
+    parser.add_argument("-chi", "--ch3lbip", help="Optional. Default '10.222.132.1'. \nIP address of CH3 load balancer", default="10.222.132.1")
+    parser.add_argument("-psi", "--ps2lbip", help="Optional. Default '10.221.132.1'. \nIP address of CH3 load balancer", default="10.221.132.1")
+    parser.add_argument("-f", "--frequency", help="Optional. Default 'T'. \nTime frequency for stats.\nH for hours, T for minutes, S for seconds", default="T")
+    args = parser.parse_args()
+
+    return args
+
+
+def load_data(in_files, cargs):
+    frequency = cargs.frequency
+    deduplicate = cargs.deduplicate
+    data = []
+    print("File names from args " + str(in_files))
+
+    full_paths = [os.path.join(os.getcwd(), path) for path in in_files]
+    files = set()
+    for path in full_paths:
+        if os.path.isfile(path):
+            files.add(path)
+        else:
+            print("File not found at path " + path)
+            sys.exit(0)
+    idx = 0
+    anoyc = 0
+    for file in files:
+        print("Reading the data from" + file)
+        with open(file) as f:
+            for entry in f:
+                try:
+                    idx = idx+1
+                    entry = entry.replace('{ "@timest{ "@timestamp"', '{ "@timestamp"')
+                    entry_ob = json.loads(entry)
+                    if entry_ob["request_uri"].startswith(route_filter):
+                        start_time = datetime.datetime.fromtimestamp(entry_ob["msec"] - entry_ob["request_time"])
+                        end_time = datetime.datetime.fromtimestamp(entry_ob["msec"])
+                        params = entry_ob["request_uri"].split("?")[1].split("&")
+                        region_id = None
+                        callId = None
+                        if params is not None:
+                            for param in params:
+                                if param.startswith("region_id="):
+                                    region_id = param.replace("region_id=", "")
+                                if param.startswith("callId="):
+                                    callId = param.replace("callId=", "")
+
+                        if callId is None:
+                            anoyc = anoyc + 1
+                            callId = "Anony" + str(anoyc)
+
+                        can_add = False
+                        obj = {"r_id": idx, "msec": entry_ob["msec"], "start_time": start_time, "end_time": end_time,
+                               "request_time": entry_ob["request_time"],
+                               "upstream_response_time": float(entry_ob["upstream_response_time"]),
+                               "upstream_status": entry_ob["upstream_status"], "request_uri": entry_ob["request_uri"],
+                               # "actives": pd.period_range(start_time, end_time, freq=frequency),
+                               "status": entry_ob["status"],
+                               "region_id": region_id, "callId": callId,
+                               "x_forwarded_for": entry_ob["x_forwarded_for"],
+                               "hostname": entry_ob["hostname"]
+                               }
+                        if deduplicate == 'Yes' or deduplicate == 'yes' or deduplicate == True or deduplicate == 'true':
+                            if obj["x_forwarded_for"].__contains__("127.0.0.1") == True or \
+                            (obj["hostname"].startswith("ps") and obj["x_forwarded_for"].__contains__(cargs.ch3lbip)) or \
+                            (obj["hostname"].startswith("ch") and obj["x_forwarded_for"].__contains__(cargs.ps2lbip)):
+                                can_add = True
+                            else:
+                                can_add = False
+                        else:
+                            can_add = True
+
+                        if can_add == True:
+                            data.append(obj)
+
+                except Exception as exc:
+                    print("Unexpected error:", sys.exc_info()[0])
+    return pd.DataFrame(data=data)
+
+
+def find_stats(df, cargs):
+    print("\nAnalysing the data..." + str(df.size))
+    start_time = df.start_time.min()
+    end_time = df.end_time.max()
+    print("\nFound data from " + str(start_time) + " - " + str(end_time) + "(" + str(end_time-start_time)  + ")\n")
+    print("Average response time\t: ", df.upstream_response_time.mean(), " seconds")
+    print("Max response time\t: ", df.upstream_response_time.max(), " seconds")
+
+    print("\nChecking for errors...")
+    errors = df.loc[df["status"] != 200].groupby(df["status"])["request_time"].count()
+
+    if errors.count() == 0:
+        print("\nNo errors found\n")
+    if errors.count() != 0:
+        print("\nFound errors:")
+        print(errors)
+        write_output(cargs.errors, df.loc[df["status"] != 200], "errors details")
+
+    print("\nCollecting stats...")
+    x = df.groupby("callId") \
+        .aggregate(
+        st=('start_time', 'min'),
+        et=('end_time', 'max'),
+        murt=('upstream_response_time', 'max'),  # max upstream_response_time
+        art=('upstream_response_time', 'mean'),
+        c=("r_id", 'nunique'),
+        callId=("callId", "first")
+    )
+    x["actives"] = x.apply(lambda row: pd.period_range(row['st'], row['et'], freq=cargs.frequency), axis=1)
+    x = x.explode("actives")
+    z = x.set_index("actives").groupby([pd.Grouper(freq=cargs.frequency)])\
+        .agg(
+            mean_resp_time=('art','mean'),
+            max_resp_time=("murt", 'max'),
+            # concurrent_reqs=("r_id", 'nunique'),
+            concurrent_calls=("callId", 'nunique')
+            # call_ids=("callId", 'unique')
+        ).sort_values(["concurrent_calls"], ascending=False)
+    print(z.head(5))
+    write_output(cargs.output, z, "stats")
+    return z
+
+
+def write_output(file, st, label="stats"):
+    print("\nWriting the " + label + " to " + file)
+    # print(st.head(5))
+    st.to_csv(file, sep="#")
+
+
+def main():
+    cargs = parse_args()
+    df = load_data(cargs.input, cargs)
+
+    find_stats(df, cargs)
+    print("Done.")
+
+main()
+
